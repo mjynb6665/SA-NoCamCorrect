@@ -4,16 +4,39 @@
 #include <cstring>
 #include <cstdarg>
 
-static const LONG ADDR_THE_CAMERA = 0xB6F028;
-static const LONG ADDR_DEFAULT_TARGET = 0xB6EC24;
+// WellBufferMe(float target, float& valueToChange, float& speedSoFar,
+//              float topSpeed, float speedStep, bool isAnAngle)
+// This is the spring/convergence helper that pulls the camera angle back toward
+// the vehicle heading. Mouse look is applied by direct "+=" on the angle fields
+// and does NOT go through here, so neutralising this function removes the
+// auto-recentre while leaving manual look intact.
+static const LONG ADDR_WELL_BUFFER_ME = 0x00509AE0;
 
-static HANDLE g_logFile = INVALID_HANDLE_VALUE;
-static HANDLE g_stopEvent = NULL;
-static HANDLE g_worker = NULL;
-static HMODULE g_module = NULL;
-static volatile LONG g_targetAddr = ADDR_DEFAULT_TARGET;
-static volatile LONG g_intervalMs = 10;
+static const BYTE PATCH_SIZE = 5;
+
+static HANDLE  g_logFile   = INVALID_HANDLE_VALUE;
+static HMODULE g_module    = NULL;
+static HANDLE  g_stopEvent = NULL;
+static HANDLE  g_retryThread = NULL;
+
+static BYTE  g_origBytes[PATCH_SIZE];
+static void* g_stub       = NULL;
+static volatile LONG g_patched = 0;
+static volatile LONG g_stubIsStdcall = 0;
 static volatile LONG g_enabled = 1;
+static volatile LONG g_mode = 0;
+
+// cdecl: caller cleans the stack, so a bare ret is correct.
+__declspec(naked) static void StubCdecl()
+{
+    __asm { ret }
+}
+
+// stdcall: callee pops the 6 arguments (4 + 4 + 4 + 4 + 4 + 4 = 24 bytes).
+__declspec(naked) static void StubStdcall()
+{
+    __asm { ret 24 }
+}
 
 static bool IEquals(const char* a, const char* b)
 {
@@ -27,9 +50,21 @@ static bool IEquals(const char* a, const char* b)
     return *a == 0 && *b == 0;
 }
 
+static void TrimTrailing(char* s)
+{
+    char* end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
+        *--end = 0;
+}
+
+static void TrimLeading(const char** s)
+{
+    while (**s == ' ' || **s == '\t') ++(*s);
+}
+
 static LONG ParseNumber(const char* s)
 {
-    while (*s == ' ' || *s == '\t') ++s;
+    TrimLeading(&s);
 
     LONG sign = 1;
     if (*s == '-') { sign = -1; ++s; }
@@ -72,6 +107,7 @@ static void Log(const char* fmt, ...)
 
     if (n < 0) n = 0;
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    buf[n] = 0;
 
     DWORD written = 0;
     WriteFile(g_logFile, buf, (DWORD)n, &written, NULL);
@@ -132,12 +168,11 @@ static bool LooksLikeSanAndreas()
     return IEquals(base, "gta-sa.exe") || IEquals(base, "gta_sa.exe");
 }
 
-static bool IsAddressUsable(LPCVOID addr)
+static bool IsAddressReadable(LPCVOID addr)
 {
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi))
         return false;
-
     if (mbi.State != MEM_COMMIT)
         return false;
 
@@ -145,10 +180,23 @@ static bool IsAddressUsable(LPCVOID addr)
     if (prot == PAGE_NOACCESS || prot == PAGE_GUARD)
         return false;
 
-    if (prot != PAGE_READWRITE && prot != PAGE_WRITECOPY &&
-        prot != PAGE_EXECUTE_READWRITE && prot != PAGE_EXECUTE_WRITECOPY)
+    return prot != 0;
+}
+
+static bool WriteBytes(void* addr, const BYTE* data, size_t n)
+{
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(addr, n, PAGE_EXECUTE_READWRITE, &oldProtect))
         return false;
 
+    volatile BYTE* p = (volatile BYTE*)addr;
+    for (size_t i = 0; i < n; ++i)
+        p[i] = data[i];
+
+    FlushInstructionCache(GetCurrentProcess(), addr, n);
+
+    DWORD ignored;
+    VirtualProtect(addr, n, oldProtect, &ignored);
     return true;
 }
 
@@ -166,8 +214,7 @@ static void LoadConfig()
 
     FILE* f = fopen(iniPath, "r");
     if (!f) {
-        Log("[cfg] no ini found, using defaults addr=0x%08lX interval=%ld\n",
-            (unsigned long)g_targetAddr, g_intervalMs);
+        Log("[cfg] no ini found, using defaults mode=%ld stub=cdecl\n", g_mode);
         return;
     }
 
@@ -180,57 +227,131 @@ static void LoadConfig()
         *eq = 0;
         char* key = line;
         char* val = eq + 1;
+        TrimTrailing(key);
 
-        char* end = key + strlen(key);
-        while (end > key && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
-            *--end = 0;
+        const char* v = val;
+        TrimLeading(&v);
 
-        if (IEquals(key, "TargetAddress")) {
-            g_targetAddr = ParseNumber(val);
-            Log("[cfg] TargetAddress = 0x%08lX\n", (unsigned long)g_targetAddr);
-        } else if (IEquals(key, "IntervalMs")) {
-            g_intervalMs = ParseNumber(val);
-            if (g_intervalMs < 1) g_intervalMs = 1;
-            if (g_intervalMs > 1000) g_intervalMs = 1000;
-            Log("[cfg] IntervalMs = %ld\n", g_intervalMs);
-        } else if (IEquals(key, "Enabled")) {
-            g_enabled = (ParseNumber(val) != 0) ? 1 : 0;
+        if (IEquals(key, "Enabled")) {
+            g_enabled = (ParseNumber(v) != 0) ? 1 : 0;
             Log("[cfg] Enabled = %ld\n", g_enabled);
+        } else if (IEquals(key, "Mode")) {
+            g_mode = ParseNumber(v);
+            Log("[cfg] Mode = %ld\n", g_mode);
+        } else if (IEquals(key, "Stub")) {
+            char buf[64];
+            size_t n = strlen(v);
+            if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+            memcpy(buf, v, n);
+            buf[n] = 0;
+            TrimTrailing(buf);
+            g_stubIsStdcall = IEquals(buf, "stdcall") ? 1 : 0;
+            Log("[cfg] Stub = %s\n", buf);
         }
     }
 
     fclose(f);
 }
 
-static DWORD WINAPI KeeperThread(LPVOID param)
+static bool LooksLikePrologue(BYTE b)
+{
+    // Common x86 function entry opcodes: push ebp/ebx/esi/edi, sub esp, mov,
+    // push imm8, push imm32, xor, lea.
+    switch (b) {
+        case 0x55: case 0x53: case 0x56: case 0x57:
+        case 0x51: case 0x52:
+        case 0x83: case 0x8B: case 0x89: case 0x6A:
+        case 0x68: case 0x33: case 0x8D: case 0x81:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ApplyPatch()
+{
+    if (!g_enabled)
+        return false;
+    if (g_mode != 0) {
+        Log("[patch] Mode %ld is not implemented yet; falling back to Mode 0\n", g_mode);
+        g_mode = 0;
+    }
+
+    g_stub = g_stubIsStdcall ? (void*)&StubStdcall : (void*)&StubCdecl;
+
+    BYTE* target = (BYTE*)(ULONG_PTR)ADDR_WELL_BUFFER_ME;
+
+    if (!IsAddressReadable(target)) {
+        Log("[patch] 0x%08lX not readable yet\n", (unsigned long)ADDR_WELL_BUFFER_ME);
+        return false;
+    }
+
+    if (target[0] == 0xE9) {
+        Log("[patch] already patched (found JMP), skipping\n");
+        g_patched = 1;
+        return true;
+    }
+
+    memcpy(g_origBytes, target, PATCH_SIZE);
+    Log("[patch] original bytes: %02X %02X %02X %02X %02X\n",
+        g_origBytes[0], g_origBytes[1], g_origBytes[2], g_origBytes[3], g_origBytes[4]);
+
+    if (!LooksLikePrologue(g_origBytes[0]))
+        Log("[patch] WARNING: first byte %02X does not look like a normal prologue.\n"
+            "        This may mean the address or the game version is wrong.\n",
+            g_origBytes[0]);
+
+    BYTE patch[PATCH_SIZE];
+    patch[0] = 0xE9;
+    DWORD rel = (DWORD)((ULONG_PTR)g_stub - ((ULONG_PTR)ADDR_WELL_BUFFER_ME + PATCH_SIZE));
+    memcpy(patch + 1, &rel, sizeof(rel));
+
+    if (!WriteBytes(target, patch, PATCH_SIZE)) {
+        Log("[patch] WriteBytes failed (%lu)\n", GetLastError());
+        return false;
+    }
+
+    if (memcmp(target, patch, PATCH_SIZE) != 0) {
+        Log("[patch] verification failed, rolling back\n");
+        WriteBytes(target, g_origBytes, PATCH_SIZE);
+        return false;
+    }
+
+    g_patched = 1;
+    Log("[patch] OK: WellBufferMe (0x%08lX) -> stub %p (%s)\n",
+        (unsigned long)ADDR_WELL_BUFFER_ME, g_stub,
+        g_stubIsStdcall ? "stdcall, ret 24" : "cdecl, ret");
+    return true;
+}
+
+static void RemovePatch()
+{
+    if (!g_patched)
+        return;
+
+    if (WriteBytes((void*)(ULONG_PTR)ADDR_WELL_BUFFER_ME, g_origBytes, PATCH_SIZE))
+        Log("[patch] original bytes restored\n");
+    else
+        Log("[patch] WARNING: could not restore original bytes\n");
+
+    g_patched = 0;
+}
+
+static DWORD WINAPI RetryThread(LPVOID param)
 {
     (void)param;
 
-    Log("[keeper] started, target=0x%08lX interval=%ld ms\n",
-        (unsigned long)g_targetAddr, g_intervalMs);
+    Log("[retry] watching for game code at 0x%08lX\n", (unsigned long)ADDR_WELL_BUFFER_ME);
 
-    DWORD lastLogged = 0;
-
-    while (WaitForSingleObject(g_stopEvent, g_intervalMs) == WAIT_TIMEOUT) {
-        if (!g_enabled)
-            continue;
-
-        if (!IsAddressUsable((LPCVOID)g_targetAddr))
-            continue;
-
-        DWORD now = GetTickCount();
-        InterlockedExchange((LONG volatile*)g_targetAddr, (LONG)now);
-
-        DWORD elapsed = now - lastLogged;
-        if (elapsed >= 5000) {
-            lastLogged = now;
-            DWORD stored = *(volatile DWORD*)g_targetAddr;
-            Log("[keeper] now=%lu stored=%lu delta=%lu\n",
-                (unsigned long)now, (unsigned long)stored, (unsigned long)(now - stored));
-        }
+    for (int i = 0; i < 300 && !g_patched; ++i) {
+        if (WaitForSingleObject(g_stopEvent, 100) != WAIT_TIMEOUT)
+            break;
+        ApplyPatch();
     }
 
-    Log("[keeper] stopped\n");
+    if (!g_patched)
+        Log("[retry] gave up after 30s, camera spring left active\n");
+
     return 0;
 }
 
@@ -264,15 +385,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 
     if (reason == DLL_PROCESS_DETACH) {
         if (g_stopEvent) SetEvent(g_stopEvent);
-        if (g_worker) {
-            WaitForSingleObject(g_worker, 2000);
-            CloseHandle(g_worker);
-            g_worker = NULL;
+        if (g_retryThread) {
+            WaitForSingleObject(g_retryThread, 3000);
+            CloseHandle(g_retryThread);
+            g_retryThread = NULL;
         }
         if (g_stopEvent) {
             CloseHandle(g_stopEvent);
             g_stopEvent = NULL;
         }
+        RemovePatch();
         Log("[exit] unloaded\n");
         CloseLog();
         return TRUE;
@@ -300,15 +422,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 
     LoadConfig();
 
-    if (!IsAddressUsable((LPCVOID)g_targetAddr)) {
-        Log("[init] ABORT: target 0x%08lX not writable\n", (unsigned long)g_targetAddr);
-        CloseLog();
+    if (g_patched || ApplyPatch()) {
+        Log("[init] OK\n");
         return TRUE;
     }
-
-    Log("[init] TheCamera probe 0x%08lX usable=%d\n",
-        (unsigned long)ADDR_THE_CAMERA, IsAddressUsable((LPCVOID)ADDR_THE_CAMERA) ? 1 : 0);
-    Log("[init] initial target value = %lu\n", (unsigned long)*(volatile DWORD*)g_targetAddr);
 
     g_stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!g_stopEvent) {
@@ -317,8 +434,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         return TRUE;
     }
 
-    g_worker = CreateThread(NULL, 0, KeeperThread, NULL, 0, NULL);
-    if (!g_worker) {
+    g_retryThread = CreateThread(NULL, 0, RetryThread, NULL, 0, NULL);
+    if (!g_retryThread) {
         Log("[init] ABORT: CreateThread failed (%lu)\n", GetLastError());
         CloseHandle(g_stopEvent);
         g_stopEvent = NULL;
@@ -326,6 +443,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         return TRUE;
     }
 
-    Log("[init] OK\n");
+    Log("[init] deferred to retry thread\n");
     return TRUE;
 }
