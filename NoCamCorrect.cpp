@@ -19,13 +19,16 @@ static void Log(const char* fmt, ...)
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    int n = _vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
     va_end(ap);
 
-    if (n > 0) {
-        DWORD written = 0;
-        WriteFile(g_logFile, buf, (DWORD)n, &written, NULL);
-    }
+    if (n < 0)
+        n = 0;
+    if (n > (int)sizeof(buf) - 1)
+        n = (int)sizeof(buf) - 1;
+
+    DWORD written = 0;
+    WriteFile(g_logFile, buf, (DWORD)n, &written, NULL);
 }
 
 static void GetPluginDir(char* out, size_t outSize)
@@ -42,7 +45,10 @@ static void GetPluginDir(char* out, size_t outSize)
     else
         path[0] = 0;
 
-    strncpy_s(out, outSize, path, _TRUNCATE);
+    size_t n = strlen(path);
+    if (n + 1 >= outSize)
+        return;
+    memcpy(out, path, n + 1);
 }
 
 static bool LooksLikeSanAndreas()
@@ -85,8 +91,11 @@ static void LoadConfig()
         return;
 
     char iniPath[MAX_PATH] = { 0 };
-    strncpy_s(iniPath, sizeof(iniPath), dir, _TRUNCATE);
-    strcat_s(iniPath, "\\NoCamCorrect.ini");
+    size_t n = strlen(dir);
+    if (n + 24 >= sizeof(iniPath))
+        return;
+    memcpy(iniPath, dir, n);
+    strcpy(iniPath + n, "\\NoCamCorrect.ini");
 
     FILE* f = fopen(iniPath, "r");
     if (!f) {
@@ -174,8 +183,11 @@ static void OpenLog()
         return;
 
     char logPath[MAX_PATH] = { 0 };
-    strncpy_s(logPath, sizeof(logPath), dir, _TRUNCATE);
-    strcat_s(logPath, "\\NoCamCorrect.log");
+    size_t n = strlen(dir);
+    if (n + 24 >= sizeof(logPath))
+        return;
+    memcpy(logPath, dir, n);
+    strcpy(logPath + n, "\\NoCamCorrect.log");
 
     g_logFile = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);

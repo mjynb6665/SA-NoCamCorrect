@@ -14,7 +14,13 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release Win32
-        run: msbuild NoCamCorrect.sln /p:Configuration=Release /p:Platform=Win32 /v:minimal
+        shell: pwsh
+        run: |
+          msbuild NoCamCorrect.sln /p:Configuration=Release /p:Platform=Win32 /v:normal 2>&1 | Tee-Object -Variable buildLog
+          $code = $LASTEXITCODE
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Build log`n``````n$buildLog`n``````"
+          if ($code -ne 0) { Write-Host "msbuild failed: $code"; exit $code }
+          Get-ChildItem -Recurse -Filter *.asi | ForEach-Object { Write-Host "Found: $($_.FullName)" }
 
       - name: Find output
         shell: pwsh
