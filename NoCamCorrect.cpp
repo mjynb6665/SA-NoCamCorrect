@@ -3,16 +3,61 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
-#include <cstdlib>
 
-extern "C" IMAGE_DOS_HEADER __ImageBase;
+static const LONG ADDR_THE_CAMERA = 0xB6F028;
+static const LONG ADDR_DEFAULT_TARGET = 0xB6EC24;
 
 static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 static HANDLE g_stopEvent = NULL;
 static HANDLE g_worker = NULL;
-static volatile LONG g_targetAddr = 0xB6EC24;
+static HMODULE g_module = NULL;
+static volatile LONG g_targetAddr = ADDR_DEFAULT_TARGET;
 static volatile LONG g_intervalMs = 10;
 static volatile LONG g_enabled = 1;
+
+static bool IEquals(const char* a, const char* b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+        ++a; ++b;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static LONG ParseNumber(const char* s)
+{
+    while (*s == ' ' || *s == '\t') ++s;
+
+    LONG sign = 1;
+    if (*s == '-') { sign = -1; ++s; }
+    else if (*s == '+') { ++s; }
+
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+        LONG v = 0;
+        while (*s) {
+            char c = *s;
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else break;
+            v = v * 16 + d;
+            ++s;
+        }
+        return sign * v;
+    }
+
+    LONG v = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        ++s;
+    }
+    return sign * v;
+}
 
 static void Log(const char* fmt, ...)
 {
@@ -22,36 +67,57 @@ static void Log(const char* fmt, ...)
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
-    int n = _vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+    int n = vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
     va_end(ap);
 
-    if (n < 0)
-        n = 0;
-    if (n > (int)sizeof(buf) - 1)
-        n = (int)sizeof(buf) - 1;
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
 
     DWORD written = 0;
     WriteFile(g_logFile, buf, (DWORD)n, &written, NULL);
 }
 
+static void EnsureModule()
+{
+    if (g_module)
+        return;
+
+    HMODULE h = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(const void*)&EnsureModule, &h)) {
+        g_module = h;
+    }
+}
+
 static void GetPluginDir(char* out, size_t outSize)
 {
-    char path[MAX_PATH] = { 0 };
-    if (GetModuleFileNameA((HMODULE)&__ImageBase, path, MAX_PATH) == 0) {
-        out[0] = 0;
+    out[0] = 0;
+    EnsureModule();
+    if (!g_module)
         return;
-    }
+
+    char path[MAX_PATH] = { 0 };
+    if (GetModuleFileNameA(g_module, path, MAX_PATH) == 0)
+        return;
 
     char* slash = strrchr(path, '\\');
-    if (slash)
-        slash[1] = 0;
-    else
-        path[0] = 0;
+    if (slash) slash[1] = 0;
+    else path[0] = 0;
 
     size_t n = strlen(path);
-    if (n + 1 >= outSize)
-        return;
+    if (n + 1 >= outSize) return;
     memcpy(out, path, n + 1);
+}
+
+static void BuildPath(char* out, size_t outSize, const char* dir, const char* name)
+{
+    size_t dn = strlen(dir);
+    size_t nn = strlen(name);
+    if (dn + nn + 2 >= outSize) { out[0] = 0; return; }
+
+    memcpy(out, dir, dn);
+    out[dn] = '\\';
+    memcpy(out + dn + 1, name, nn + 1);
 }
 
 static bool LooksLikeSanAndreas()
@@ -63,7 +129,7 @@ static bool LooksLikeSanAndreas()
     const char* base = strrchr(exePath, '\\');
     base = base ? base + 1 : exePath;
 
-    return (_stricmp(base, "gta-sa.exe") == 0) || (_stricmp(base, "gta_sa.exe") == 0);
+    return IEquals(base, "gta-sa.exe") || IEquals(base, "gta_sa.exe");
 }
 
 static bool IsAddressUsable(LPCVOID addr)
@@ -94,11 +160,9 @@ static void LoadConfig()
         return;
 
     char iniPath[MAX_PATH] = { 0 };
-    size_t n = strlen(dir);
-    if (n + 24 >= sizeof(iniPath))
+    BuildPath(iniPath, sizeof(iniPath), dir, "NoCamCorrect.ini");
+    if (iniPath[0] == 0)
         return;
-    memcpy(iniPath, dir, n);
-    strcpy(iniPath + n, "\\NoCamCorrect.ini");
 
     FILE* f = fopen(iniPath, "r");
     if (!f) {
@@ -117,23 +181,20 @@ static void LoadConfig()
         char* key = line;
         char* val = eq + 1;
 
-        while (*key == ' ' || *key == '\t') key++;
         char* end = key + strlen(key);
         while (end > key && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
             *--end = 0;
 
-        while (*val == ' ' || *val == '\t') val++;
-
-        if (_stricmp(key, "TargetAddress") == 0) {
-            g_targetAddr = (LONG)_strtoul(val, NULL, 0);
+        if (IEquals(key, "TargetAddress")) {
+            g_targetAddr = ParseNumber(val);
             Log("[cfg] TargetAddress = 0x%08lX\n", (unsigned long)g_targetAddr);
-        } else if (_stricmp(key, "IntervalMs") == 0) {
-            g_intervalMs = _strtol(val, NULL, 0);
+        } else if (IEquals(key, "IntervalMs")) {
+            g_intervalMs = ParseNumber(val);
             if (g_intervalMs < 1) g_intervalMs = 1;
             if (g_intervalMs > 1000) g_intervalMs = 1000;
             Log("[cfg] IntervalMs = %ld\n", g_intervalMs);
-        } else if (_stricmp(key, "Enabled") == 0) {
-            g_enabled = (_strtol(val, NULL, 0) != 0) ? 1 : 0;
+        } else if (IEquals(key, "Enabled")) {
+            g_enabled = (ParseNumber(val) != 0) ? 1 : 0;
             Log("[cfg] Enabled = %ld\n", g_enabled);
         }
     }
@@ -149,18 +210,13 @@ static DWORD WINAPI KeeperThread(LPVOID param)
         (unsigned long)g_targetAddr, g_intervalMs);
 
     DWORD lastLogged = 0;
-    DWORD missCount = 0;
 
     while (WaitForSingleObject(g_stopEvent, g_intervalMs) == WAIT_TIMEOUT) {
         if (!g_enabled)
             continue;
 
-        if (!IsAddressUsable((LPCVOID)g_targetAddr)) {
-            missCount++;
-            if (missCount <= 3)
-                Log("[keeper] target not writable (miss %lu)\n", (unsigned long)missCount);
+        if (!IsAddressUsable((LPCVOID)g_targetAddr))
             continue;
-        }
 
         DWORD now = GetTickCount();
         InterlockedExchange((LONG volatile*)g_targetAddr, (LONG)now);
@@ -169,7 +225,7 @@ static DWORD WINAPI KeeperThread(LPVOID param)
         if (elapsed >= 5000) {
             lastLogged = now;
             DWORD stored = *(volatile DWORD*)g_targetAddr;
-            Log("[keeper] tick now=%lu stored=%lu delta=%lu\n",
+            Log("[keeper] now=%lu stored=%lu delta=%lu\n",
                 (unsigned long)now, (unsigned long)stored, (unsigned long)(now - stored));
         }
     }
@@ -186,14 +242,12 @@ static void OpenLog()
         return;
 
     char logPath[MAX_PATH] = { 0 };
-    size_t n = strlen(dir);
-    if (n + 24 >= sizeof(logPath))
+    BuildPath(logPath, sizeof(logPath), dir, "NoCamCorrect.log");
+    if (logPath[0] == 0)
         return;
-    memcpy(logPath, dir, n);
-    strcpy(logPath + n, "\\NoCamCorrect.log");
 
     g_logFile = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 }
 
 static void CloseLog()
@@ -209,8 +263,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     (void)reserved;
 
     if (reason == DLL_PROCESS_DETACH) {
-        if (g_stopEvent)
-            SetEvent(g_stopEvent);
+        if (g_stopEvent) SetEvent(g_stopEvent);
         if (g_worker) {
             WaitForSingleObject(g_worker, 2000);
             CloseHandle(g_worker);
@@ -229,8 +282,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         return TRUE;
 
     DisableThreadLibraryCalls(module);
-    OpenLog();
+    g_module = module;
 
+    OpenLog();
     Log("\n=== NoCamCorrect loaded ===\n");
 
     char exePath[MAX_PATH] = { 0 };
@@ -247,13 +301,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     LoadConfig();
 
     if (!IsAddressUsable((LPCVOID)g_targetAddr)) {
-        Log("[init] ABORT: default target 0x%08lX is not writable\n", (unsigned long)g_targetAddr);
+        Log("[init] ABORT: target 0x%08lX not writable\n", (unsigned long)g_targetAddr);
         CloseLog();
         return TRUE;
     }
 
-    DWORD stored = *(volatile DWORD*)g_targetAddr;
-    Log("[init] initial value at target = %lu\n", (unsigned long)stored);
+    Log("[init] TheCamera probe 0x%08lX usable=%d\n",
+        (unsigned long)ADDR_THE_CAMERA, IsAddressUsable((LPCVOID)ADDR_THE_CAMERA) ? 1 : 0);
+    Log("[init] initial target value = %lu\n", (unsigned long)*(volatile DWORD*)g_targetAddr);
 
     g_stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!g_stopEvent) {

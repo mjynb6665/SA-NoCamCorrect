@@ -1,0 +1,10 @@
+﻿obj/
+build/
+*.obj
+*.asi
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
+.vs/
