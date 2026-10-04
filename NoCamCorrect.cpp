@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cstdlib>
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 static HANDLE g_stopEvent = NULL;
@@ -122,15 +125,15 @@ static void LoadConfig()
         while (*val == ' ' || *val == '\t') val++;
 
         if (_stricmp(key, "TargetAddress") == 0) {
-            g_targetAddr = (LONG)strtoul(val, NULL, 0);
+            g_targetAddr = (LONG)_strtoul(val, NULL, 0);
             Log("[cfg] TargetAddress = 0x%08lX\n", (unsigned long)g_targetAddr);
         } else if (_stricmp(key, "IntervalMs") == 0) {
-            g_intervalMs = strtol(val, NULL, 0);
+            g_intervalMs = _strtol(val, NULL, 0);
             if (g_intervalMs < 1) g_intervalMs = 1;
             if (g_intervalMs > 1000) g_intervalMs = 1000;
             Log("[cfg] IntervalMs = %ld\n", g_intervalMs);
         } else if (_stricmp(key, "Enabled") == 0) {
-            g_enabled = (strtol(val, NULL, 0) != 0) ? 1 : 0;
+            g_enabled = (_strtol(val, NULL, 0) != 0) ? 1 : 0;
             Log("[cfg] Enabled = %ld\n", g_enabled);
         }
     }
