@@ -14,17 +14,25 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build with cl.exe
-        shell: cmd
+        shell: pwsh
         run: |
-          set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
-          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
-          echo VSPATH=%VSPATH%
-          if "%VSPATH%"=="" exit /b 1
-          call "%VSPATH%\VC\Auxiliary\Build\vcvars32.bat" || exit /b 1
-          if not exist build mkdir build
-          cl.exe /nologo /LD /O2 /MT /GS- /EHsc /DWIN32 /D_WINDOWS /D_USRDLL /Fe:build\NoCamCorrect.asi /Fo:build\ NoCamCorrect.cpp /link /SUBSYSTEM:WINDOWS /MACHINE:X86
-          if errorlevel 1 exit /b 1
-          dir build\NoCamCorrect.asi
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "VSPATH=$vsPath"
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars32.bat'
+          Write-Host "VCVARS=$vcvars"
+
+          cmd /c "`"$vcvars`" && set" | Out-String | ForEach-Object { $envLines = $_ } 
+          foreach ($line in ($envLines -split "`r?`n")) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              Set-Item -Path "Env:$($matches[1])" -Value $matches[2] -ErrorAction SilentlyContinue
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          cl.exe /nologo /LD /O2 /MT /EHsc /DWIN32 /D_WINDOWS /D_USRDLL "/Fe:build\NoCamCorrect.asi" "/Fo:build\" NoCamCorrect.cpp /link /SUBSYSTEM:WINDOWS /MACHINE:X86
+          if ($LASTEXITCODE -ne 0) { Write-Host "cl.exe failed with $LASTEXITCODE"; exit 1 }
+          Get-ChildItem build
 
       - name: Upload NoCamCorrect.asi
         uses: actions/upload-artifact@v4
