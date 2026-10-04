@@ -1,0 +1,30 @@
+name: Build NoCamCorrect
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release Win32
+        run: msbuild NoCamCorrect.vcxproj /p:Configuration=Release /p:Platform=Win32
+
+      - name: Find output
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Filter "NoCamCorrect.asi"
+          foreach ($f in $files) { Write-Host "Found: $($f.FullName)" }
+          if ($files.Count -eq 0) { Write-Host "No ASI found!" }
+
+      - name: Upload NoCamCorrect.asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoCamCorrect
+          path: "**/NoCamCorrect.asi"
