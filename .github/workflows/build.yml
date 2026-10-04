@@ -13,29 +13,18 @@ jobs:
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build with cl.exe
+      - name: Build Release Win32
+        run: msbuild NoCamCorrect.sln /p:Configuration=Release /p:Platform=Win32 /v:minimal
+
+      - name: Find output
         shell: pwsh
         run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          Write-Host "VSPATH=$vsPath"
-          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars32.bat'
-          Write-Host "VCVARS=$vcvars"
-
-          cmd /c "`"$vcvars`" && set" | Out-String | ForEach-Object { $envLines = $_ } 
-          foreach ($line in ($envLines -split "`r?`n")) {
-            if ($line -match '^([^=]+)=(.*)$') {
-              Set-Item -Path "Env:$($matches[1])" -Value $matches[2] -ErrorAction SilentlyContinue
-            }
-          }
-
-          New-Item -ItemType Directory -Force -Path build | Out-Null
-          cl.exe /nologo /LD /O2 /MT /EHsc /DWIN32 /D_WINDOWS /D_USRDLL "/Fe:build\NoCamCorrect.asi" "/Fo:build\" NoCamCorrect.cpp /link /SUBSYSTEM:WINDOWS /MACHINE:X86
-          if ($LASTEXITCODE -ne 0) { Write-Host "cl.exe failed with $LASTEXITCODE"; exit 1 }
-          Get-ChildItem build
+          $files = Get-ChildItem -Recurse -Filter "NoCamCorrect.asi"
+          foreach ($f in $files) { Write-Host "Found: $($f.FullName)" }
+          if ($files.Count -eq 0) { Write-Host "No ASI found!"; exit 1 }
 
       - name: Upload NoCamCorrect.asi
         uses: actions/upload-artifact@v4
         with:
           name: NoCamCorrect
-          path: "build/NoCamCorrect.asi"
+          path: "**/NoCamCorrect.asi"
