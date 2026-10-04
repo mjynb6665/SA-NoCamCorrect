@@ -13,18 +13,21 @@ jobs:
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build Release Win32
-        run: msbuild NoCamCorrect.vcxproj /p:Configuration=Release /p:Platform=Win32
-
-      - name: Find output
-        shell: pwsh
+      - name: Build with cl.exe
+        shell: cmd
         run: |
-          $files = Get-ChildItem -Recurse -Filter "NoCamCorrect.asi"
-          foreach ($f in $files) { Write-Host "Found: $($f.FullName)" }
-          if ($files.Count -eq 0) { Write-Host "No ASI found!" }
+          set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          echo VSPATH=%VSPATH%
+          if "%VSPATH%"=="" exit /b 1
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars32.bat" || exit /b 1
+          if not exist build mkdir build
+          cl.exe /nologo /LD /O2 /MT /GS- /EHsc /DWIN32 /D_WINDOWS /D_USRDLL /Fe:build\NoCamCorrect.asi /Fo:build\ NoCamCorrect.cpp /link /SUBSYSTEM:WINDOWS /MACHINE:X86
+          if errorlevel 1 exit /b 1
+          dir build\NoCamCorrect.asi
 
       - name: Upload NoCamCorrect.asi
         uses: actions/upload-artifact@v4
         with:
           name: NoCamCorrect
-          path: "**/NoCamCorrect.asi"
+          path: "build/NoCamCorrect.asi"
